@@ -3,15 +3,15 @@ class User
     def initialize(user)
       super()
       @user = user
-      @processed_entries = ProcessedEntries.new
-      @processed_activities = ProcessedActivities.new
+      @processed_entries = ProcessedEntries.new(user)
+      @processed_activities = ProcessedActivities.new(user)
     end
 
     def run
       Instrumentation.instrument(title: "#{self.class.name}#run") do
         user.with_time_zone do
           calculate_activities_per_day_from_history
-          save
+          processed_activities.save!
         end
       end
 
@@ -27,6 +27,8 @@ class User
                   .entries
                   .order(:timestamp, :item_id, :amount, :created_at)
 
+      processed_entries.clear_cache
+
       entries.each do |entry|
         generate_activity_from_entry(entry)
 
@@ -35,8 +37,8 @@ class User
     end
 
     def generate_activity_from_entry(current_entry)
-      date = current_entry.timestamp.in_time_zone.to_date
       item = current_entry.item
+      date = current_entry.timestamp.in_time_zone.to_date
 
       activity = processed_activities.find_or_new(item, date)
 
@@ -50,67 +52,63 @@ class User
     end
 
     def calculate_amount_from_last_entry_position(current_entry, item, date)
-      previous_entry = processed_entries.find_last_for(item, date)
+      last_amount = processed_entries.find_last_amount(item, date) || current_entry.amount
 
-      if previous_entry.blank?
-        current_entry.amount
-      else
-        current_entry.amount - previous_entry.amount
-      end
-    end
-
-    def save
-      user.transaction do
-        user.activities.delete_all
-        activities_data = processed_activities.as_attributes_array("item_id", "amount", "date")
-
-        user.activities.insert_all(activities_data) if activities_data.any?
-      end
-    end
-
-    class ProcessedEntries
-      def initialize
-        @entries = {}
-      end
-
-      def <<(entry)
-        entries["#{entry.mal_id}/#{entry.kind}"] ||= []
-        entries["#{entry.mal_id}/#{entry.kind}"] << entry
-      end
-
-      def find_last_for(item, date)
-        entries
-          .fetch("#{item.mal_id}/#{item.kind}", [])
-          .sort_by { |entry| [entry.timestamp, entry.amount] }
-          .find_all { |entry| entry.timestamp.in_time_zone.to_date <= date }
-          .last
-      end
-
-      private
-
-      attr_reader :entries
+      current_entry.amount - last_amount
     end
 
     class ProcessedActivities
-      def initialize
+      def initialize(user)
+        super()
+        @user = user
         @activities = {}
       end
 
       def find_or_new(item, date)
-        activities["#{item.mal_id}/#{item.kind}/#{date}"] ||= Activity.new(item: item, date: date, amount: 0)
+        @activities["#{item.id}/#{date}"] ||= @user.activities.build(item: item, date: date, amount: 0)
       end
 
-      def to_a
-        activities.values.flatten
+      def save!
+        @user.activities.transaction do
+          @user.activities.delete_all
+          @activities.each_value(&:save!)
+        end
+      end
+    end
+
+    class ProcessedEntries
+      def initialize(user)
+        super()
+        @redis = Redis.new(url: ENV["REDIS_URL"])
+        @user = user
       end
 
-      def as_attributes_array(*attrs)
-        to_a.map { |activity| activity.attributes.extract!(*attrs) }
+      def <<(entry)
+        score = "#{entry.timestamp.in_time_zone.to_date.strftime('%Y%m%d')}.#{entry.amount}".to_f
+
+        @redis.zadd(redis_key(entry.item_id), score, entry.amount)
+      end
+
+      def find_last_amount(item, date)
+        result = @redis.zrevrangebyscore(redis_key(item.id), date.strftime("%Y%m%d").to_s, "-inf", limit: [0, 1])
+        result.first.present? ? result.first.to_i : nil
+      end
+
+      def clear_cache
+        @redis.del "#{base_key}:*"
       end
 
       private
 
-      attr_reader :activities
+      attr_reader :user
+
+      def redis_key(item)
+        "#{base_key}:#{item}"
+      end
+
+      def base_key
+        "#{self.class}:#{@user.id}"
+      end
     end
   end
 end
